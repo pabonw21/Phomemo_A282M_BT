@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""
+CUPS Backend for Phomemo and QY Thermal Bluetooth Printers
+Supports Bluetooth RFCOMM (Serial Port Profile) with CUPS sidechannel & backchannel.
+
+Author: Community Open Source Project
+License: MIT
+"""
+
+import sys
+import os
+import time
+import socket
+import select
+import re
+import ctypes
+
+# CUPS Exit Codes
+CUPS_BACKEND_OK = 0
+CUPS_BACKEND_FAILED = 1
+CUPS_BACKEND_CANCEL = 2
+CUPS_BACKEND_STOP = 3
+CUPS_BACKEND_RETRY = 4
+CUPS_BACKEND_RETRY_CURRENT = 5
+
+# CUPS Sidechannel Commands & Statuses
+CUPS_SC_CMD_DRAIN_OUTPUT = 2
+CUPS_SC_STATUS_OK = 1  # Note: cups_sc_status_e: CUPS_SC_STATUS_NONE=0, CUPS_SC_STATUS_OK=1
+
+# Attempt to load libcups for native sidechannel / backchannel support
+libcups = None
+for libname in ('libcups.so.2', 'libcups.so'):
+    try:
+        libcups = ctypes.CDLL(libname)
+        break
+    except OSError:
+        pass
+
+if libcups:
+    try:
+        libcups.cupsBackChannelWrite.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_double]
+        libcups.cupsBackChannelWrite.restype = ctypes.c_ssize_t
+        
+        libcups.cupsSideChannelRead.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_double
+        ]
+        libcups.cupsSideChannelRead.restype = ctypes.c_int
+
+        libcups.cupsSideChannelWrite.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_double
+        ]
+        libcups.cupsSideChannelWrite.restype = ctypes.c_int
+    except AttributeError:
+        libcups = None
+
+
+def discover_devices():
+    """
+    Called by CUPS when backend is invoked with no arguments.
+    Scans BlueZ for paired/known Bluetooth printers and outputs discovery records.
+    """
+    # Always output generic entry so CUPS knows backend is available
+    print('direct phomemo-rfcomm "Unknown" "Phomemo / QY Bluetooth Printer" "MFG:Phomemo;CMD:ESC/POS;"')
+
+    try:
+        import dbus
+        bus = dbus.SystemBus()
+        manager = dbus.Interface(bus.get_object('org.bluez', '/'), 'org.freedesktop.DBus.ObjectManager')
+        objects = manager.GetManagedObjects()
+
+        PRINTER_KEYWORDS = (
+            'a281', 'a282', 'a285', 'a28u', 'a886', 'a887',
+            'm08', 'm04', 'm83', 'p83', 'q30', 's82', 't08', 'tp8', 'g100',
+            'phomemo', 'd50', 'm110', 'm120', 'm220', 'printer', 'qy'
+        )
+
+        known_printers = []
+        for path, interfaces in objects.items():
+            if 'org.bluez.Device1' in interfaces:
+                dev = interfaces['org.bluez.Device1']
+                name = str(dev.get('Name', dev.get('Alias', 'Unknown')))
+                addr = str(dev.get('Address', ''))
+                uuids = [str(u).lower() for u in dev.get('UUIDs', [])]
+                icon = str(dev.get('Icon', ''))
+                try:
+                    dev_class = int(dev.get('Class', 0))
+                except (ValueError, TypeError):
+                    dev_class = 0
+
+                is_printer_icon = (icon == 'printer')
+                is_printer_class = (((dev_class & 0x1f00) >> 8) == 6)
+                is_printer_name = any(kw in name.lower() for kw in PRINTER_KEYWORDS)
+                is_audio = (icon in ('audio-card', 'audio-headset', 'audio-headphones')) or (((dev_class & 0x1f00) >> 8) == 4)
+                has_spp = '00001101-0000-1000-8000-00805f9b34fb' in uuids
+                has_hcrp = '00001126-0000-1000-8000-00805f9b34fb' in uuids
+
+                # Skip audio devices (headphones, speakers) that might have SPP or generic names
+                if is_audio and not is_printer_name:
+                    continue
+
+                # Match logic:
+                # 1. Name explicitly matches known printer models (even if BlueZ has not cached SDP UUIDs yet)
+                # 2. Or device has HCRP (Hardcopy Cable Replacement Profile)
+                # 3. Or device class/icon is printer and either has SPP or no UUIDs cached yet
+                # 4. Or SPP profile is present and name contains 'print'
+                is_match = (
+                    is_printer_name or
+                    has_hcrp or
+                    ((is_printer_icon or is_printer_class) and (has_spp or not uuids)) or
+                    (has_spp and 'print' in name.lower())
+                )
+
+                if is_match:
+                    known_printers.append((addr, name))
+
+        for addr, name in known_printers:
+            dash_addr = addr.replace(':', '-')
+            uri = f"phomemo-rfcomm://{dash_addr}/1"
+            info = f"{name} ({addr}) via Bluetooth RFCOMM"
+            device_id = f"MFG:Phomemo;MDL:{name};CMD:ESC/POS;"
+            print(f'direct {uri} "{name}" "{info}" "{device_id}"')
+
+    except Exception as e:
+        sys.stderr.write(f"DEBUG: Discovery failed or dbus not available: {e}\n")
+
+    sys.stdout.flush()
+    return CUPS_BACKEND_OK
+
+
+def parse_uri(uri):
+    """
+    Extracts MAC address and channel from URI.
+    Supported formats:
+      phomemo-rfcomm://5E:76:58:2F:6C:A3/1
+      phomemo-rfcomm://5E:76:58:2F:6C:A3
+      phomemo-rfcomm://5E-76-58-2F-6C-A3/1
+    """
+    pattern = r"phomemo-rfcomm://([0-9A-Fa-f:_-]{12,17})(?:/(\d+))?"
+    m = re.search(pattern, uri)
+    if not m:
+        # Fallback simple regex for raw MAC
+        mac_match = re.search(r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})", uri)
+        if mac_match:
+            mac = mac_match.group(0).replace('-', ':').upper()
+            return mac, 1
+        return None, 1
+
+    raw_mac = m.group(1).replace('-', ':').replace('_', ':').upper()
+    # Normalize if without colons
+    if len(raw_mac) == 12 and ':' not in raw_mac:
+        raw_mac = ':'.join(raw_mac[i:i+2] for i in range(0, 12, 2))
+
+    channel = int(m.group(2)) if m.group(2) else 1
+    return raw_mac, channel
+
+
+def handle_sidechannel():
+    """
+    Check and respond to CUPS sidechannel queries (e.g. DRAIN_OUTPUT).
+    """
+    if not libcups:
+        return
+    cmd = ctypes.c_int()
+    status = ctypes.c_int()
+    buf = ctypes.create_string_buffer(512)
+    datalen = ctypes.c_int(512)
+
+    # 0.001s timeout
+    res = libcups.cupsSideChannelRead(
+        ctypes.byref(cmd),
+        ctypes.byref(status),
+        buf,
+        ctypes.byref(datalen),
+        ctypes.c_double(0.001)
+    )
+    if res == 0:
+        # Command received
+        cmd_val = cmd.value
+        # If DRAIN_OUTPUT or GET_BIDI or any query
+        libcups.cupsSideChannelWrite(
+            cmd_val,
+            CUPS_SC_STATUS_OK,
+            None,
+            0,
+            ctypes.c_double(1.0)
+        )
+
+
+def write_backchannel(data):
+    """
+    Sends data received from printer back to CUPS filter.
+    """
+    if not data:
+        return
+    if libcups:
+        try:
+            libcups.cupsBackChannelWrite(data, len(data), ctypes.c_double(1.0))
+            return
+        except Exception:
+            pass
+    # Fallback to direct FD write
+    for fd in (3, 4):
+        try:
+            os.write(fd, data)
+            break
+        except OSError:
+            pass
+
+
+def print_job(args):
+    """
+    Print job handler.
+    CUPS arguments: job-id user title copies options [filename]
+    """
+    uri = os.environ.get('DEVICE_URI', '')
+    if not uri and len(args) > 0:
+        # Check if URI was passed as option or first param in manual runs
+        uri = args[0]
+
+    mac, channel = parse_uri(uri)
+    if not mac:
+        sys.stderr.write(f"ERROR: Invalid or missing DEVICE_URI: '{uri}'\n")
+        return CUPS_BACKEND_STOP
+
+    sys.stderr.write(f"STATE: +connecting-to-device\n")
+    sys.stderr.write(f"INFO: Connecting to Bluetooth printer {mac} (channel {channel})...\n")
+
+    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+    sock.settimeout(15.0)
+
+    try:
+        sock.connect((mac, channel))
+    except Exception as e:
+        sys.stderr.write(f"ERROR: Failed to connect to {mac}: {e}\n")
+        sys.stderr.write("STATE: -connecting-to-device\n")
+        return CUPS_BACKEND_RETRY
+
+    sys.stderr.write("STATE: -connecting-to-device\n")
+    sys.stderr.write(f"INFO: Connected to {mac}. Transmitting print data...\n")
+
+    # Determine input source
+    # If 6th argument exists and is a valid file, read from it, otherwise stdin
+    input_file = None
+    if len(args) >= 6 and os.path.exists(args[5]):
+        input_file = open(args[5], 'rb')
+        in_fd = input_file.fileno()
+    else:
+        in_fd = sys.stdin.fileno()
+
+    os.set_blocking(in_fd, False)
+    sock.setblocking(False)
+
+    chunk_size = 1024
+    total_sent = 0
+    input_eof = False
+    send_buffer = bytearray()
+
+    try:
+        while True:
+            # Poll sidechannel
+            handle_sidechannel()
+
+            # Build select sets
+            r_list = [sock]
+            if not input_eof:
+                r_list.append(in_fd)
+            w_list = [sock] if send_buffer else []
+
+            try:
+                r_ready, w_ready, _ = select.select(r_list, w_list, [], 0.05)
+            except (select.error, ValueError):
+                break
+
+            # Read from printer (responses to queries like 1f 11 07)
+            if sock in r_ready:
+                try:
+                    resp = sock.recv(1024)
+                    if resp:
+                        sys.stderr.write(f"DEBUG: Printer returned {len(resp)} bytes: {resp.hex()}\n")
+                        write_backchannel(resp)
+                    else:
+                        sys.stderr.write("WARNING: Printer closed connection unexpectedly.\n")
+                        break
+                except (BlockingIOError, ConnectionResetError):
+                    pass
+
+            # Read input data from filter / file
+            if in_fd in r_ready and not input_eof:
+                try:
+                    data = os.read(in_fd, chunk_size)
+                    if data:
+                        send_buffer.extend(data)
+                    else:
+                        input_eof = True
+                except BlockingIOError:
+                    pass
+
+            # Write buffered data to printer socket
+            if sock in w_ready and send_buffer:
+                try:
+                    sent = sock.send(send_buffer[:chunk_size])
+                    if sent > 0:
+                        del send_buffer[:sent]
+                        total_sent += sent
+                        # Slight delay to respect thermal printer buffer
+                        time.sleep(0.002)
+                except (BlockingIOError, socket.error) as e:
+                    sys.stderr.write(f"DEBUG: Socket send error: {e}\n")
+
+            # Check if finished
+            if input_eof and not send_buffer:
+                break
+
+        # Allow printer buffer to complete printing
+        time.sleep(1.0)
+        sys.stderr.write(f"INFO: Print job completed successfully ({total_sent} bytes transmitted).\n")
+        return CUPS_BACKEND_OK
+
+    finally:
+        try:
+            sock.close()
+        except:
+            pass
+        if input_file:
+            input_file.close()
+
+
+def main():
+    # If called with no arguments: Discovery mode
+    if len(sys.argv) == 1:
+        sys.exit(discover_devices())
+
+    # If called with arguments: Print job mode
+    # argv: backend job-id user title copies options [filename]
+    sys.exit(print_job(sys.argv[1:]))
+
+
+if __name__ == '__main__':
+    main()

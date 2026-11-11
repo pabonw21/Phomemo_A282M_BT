@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+Phomemo / QY Bluetooth Thermal Printer Direct CLI Tool
+Prints images, text, and raw data directly over Bluetooth RFCOMM (SPP)
+without requiring CUPS.
+
+License: MIT
+"""
+
+import sys
+import os
+import time
+import socket
+import argparse
+import re
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+# Paper width specifications in dots (at 203 DPI, 8 dots/mm)
+PAPER_WIDTHS = {
+    'a4': 1664,       # ~208 mm printable width
+    'letter': 1664,   # ~8.5 inch printable width
+    '110mm': 880,     # ~110 mm
+    '80mm': 576,      # ~72 mm (standard 80mm thermal paper)
+    '53mm': 384,      # ~48 mm (pocket roll)
+}
+
+
+PRINTER_KEYWORDS = (
+    'a281', 'a282', 'a285', 'a28u', 'a886', 'a887',
+    'm08', 'm04', 'm83', 'p83', 'q30', 's82', 't08', 'tp8', 'g100',
+    'phomemo', 'd50', 'm110', 'm120', 'm220', 'printer', 'qy'
+)
+
+
+def active_scan(timeout=5):
+    """Trigger a temporary Bluetooth discovery scan in BlueZ."""
+    import subprocess
+    try:
+        subprocess.run(['bluetoothctl', '--timeout', str(timeout), 'scan', 'on'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout+2)
+    except Exception:
+        try:
+            subprocess.run(['timeout', str(timeout), 'bluetoothctl', 'scan', 'on'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout+2)
+        except Exception:
+            pass
+
+
+def pair_device(mac):
+    """Pair, trust, and probe RFCOMM connection for a printer device."""
+    import subprocess
+    clean_mac = mac.strip().upper().replace('-', ':')
+    print(f"[*] Trusting and pairing printer {clean_mac}...")
+    subprocess.run(['bluetoothctl', 'power', 'on'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(['bluetoothctl', 'trust', clean_mac], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(['bluetoothctl', 'pair', clean_mac], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    print("[*] Probing RFCOMM SPP channel 1 (initializing BlueZ SDP service cache)...")
+    try:
+        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+        sock.settimeout(3.0)
+        sock.connect((clean_mac, 1))
+        sock.close()
+        print("[+] Probe succeeded! BlueZ SDP service record initialized.")
+    except Exception as e:
+        print(f"[*] Note: Connection probe completed ({e}). Device registered in BlueZ.")
+
+
+def scan_devices(active=False, timeout=5):
+    """Scan BlueZ for available or paired Phomemo / thermal printers."""
+    if active:
+        active_scan(timeout)
+
+    printers = []
+    try:
+        import dbus
+        bus = dbus.SystemBus()
+        manager = dbus.Interface(bus.get_object('org.bluez', '/'), 'org.freedesktop.DBus.ObjectManager')
+        objects = manager.GetManagedObjects()
+
+        for path, interfaces in objects.items():
+            if 'org.bluez.Device1' in interfaces:
+                dev = interfaces['org.bluez.Device1']
+                name = str(dev.get('Name', dev.get('Alias', 'Unknown')))
+                addr = str(dev.get('Address', ''))
+                icon = str(dev.get('Icon', ''))
+                uuids = [str(u).lower() for u in dev.get('UUIDs', [])]
+                try:
+                    dev_class = int(dev.get('Class', 0))
+                except (ValueError, TypeError):
+                    dev_class = 0
+
+                is_printer_icon = (icon == 'printer')
+                is_printer_class = (((dev_class & 0x1f00) >> 8) == 6)
+                is_printer_name = any(kw in name.lower() for kw in PRINTER_KEYWORDS)
+                is_audio = (icon in ('audio-card', 'audio-headset', 'audio-headphones')) or (((dev_class & 0x1f00) >> 8) == 4)
+                has_spp = '00001101-0000-1000-8000-00805f9b34fb' in uuids
+                has_hcrp = '00001126-0000-1000-8000-00805f9b34fb' in uuids
+
+                if is_audio and not is_printer_name:
+                    continue
+
+                is_match = (
+                    is_printer_name or
+                    has_hcrp or
+                    ((is_printer_icon or is_printer_class) and (has_spp or not uuids)) or
+                    (has_spp and 'print' in name.lower())
+                )
+
+                if is_match:
+                    paired = bool(dev.get('Paired', False))
+                    connected = bool(dev.get('Connected', False))
+                    printers.append({
+                        'address': addr,
+                        'name': name,
+                        'paired': paired,
+                        'connected': connected
+                    })
+    except Exception as e:
+        print(f"[!] Warning: BlueZ DBus query failed: {e}", file=sys.stderr)
+
+    return printers
+
+
+def auto_detect_device():
+    printers = scan_devices()
+    if not printers:
+        # Try active scan if nothing found in initial cache
+        printers = scan_devices(active=True, timeout=4)
+    if not printers:
+        return None
+    # Prioritize A282 or M08F or Phomemo
+    for p in printers:
+        if any(kw in p['name'].lower() for kw in ('a282', 'm08', 'phomemo')):
+            return p['address']
+    return printers[0]['address']
+
+
+def connect_printer(mac, channel=1, timeout=10.0):
+    print(f"[*] Connecting to {mac} on RFCOMM channel {channel}...")
+    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+    sock.settimeout(timeout)
+    sock.connect((mac, channel))
+    print("[+] Connected successfully!")
+    return sock
+
+
+def send_in_chunks(sock, data, chunk_size=1024, delay=0.003):
+    total = len(data)
+    sent = 0
+    while sent < total:
+        chunk = data[sent:sent+chunk_size]
+        sock.sendall(chunk)
+        sent += len(chunk)
+        if delay > 0:
+            time.sleep(delay)
+
+
+def image_to_escpos_raster(img, target_width=1664, dither=True):
+    """
+    Converts a PIL image to ESC/POS raster bit image commands (GS v 0).
+    """
+    # Resize preserving aspect ratio
+    w, h = img.size
+    new_h = int(h * (target_width / w))
+    img_resized = img.resize((target_width, new_h), Image.Resampling.LANCZOS)
+
+    # Convert to grayscale
+    gray = img_resized.convert('L')
+
+    # Convert to 1-bit monochrome
+    if dither:
+        bw = gray.convert('1', dither=Image.Dither.FLOYDSTEINBERG)
+    else:
+        # Simple threshold
+        bw = gray.point(lambda p: 255 if p > 128 else 0, mode='1')
+
+    # In PIL mode '1', 0 is black, 255 is white.
+    # ESC/POS expects 1 for black (burn dot), 0 for white (no burn).
+    # Invert image
+    raw = bw.tobytes()
+    inverted = bytes([b ^ 0xFF for b in raw])
+
+    # Build ESC/POS GS v 0 command
+    # GS v 0 m xL xH yL yH [data]
+    # To avoid printer buffer overflow on large pages, send in slices of max 256 lines
+    slice_height = 256
+    bytes_per_line = (target_width + 7) // 8
+
+    full_payload = bytearray()
+    # Init printer: ESC @
+    full_payload.extend(b'\x1b\x40')
+
+    for y in range(0, new_h, slice_height):
+        current_lines = min(slice_height, new_h - y)
+        start_byte = y * bytes_per_line
+        end_byte = start_byte + (current_lines * bytes_per_line)
+        slice_data = inverted[start_byte:end_byte]
+
+        xL = bytes_per_line & 0xFF
+        xH = (bytes_per_line >> 8) & 0xFF
+        yL = current_lines & 0xFF
+        yH = (current_lines >> 8) & 0xFF
+
+        header = bytes([0x1D, ord('v'), ord('0'), 0, xL, xH, yL, yH])
+        full_payload.extend(header)
+        full_payload.extend(slice_data)
+
+    return full_payload
+
+
+def text_to_raster(text_str, target_width=1664):
+    """Render plain text to a raster image at 203 DPI."""
+    if not HAS_PIL:
+        raise RuntimeError("Pillow is required for text rendering. Install with: pip install Pillow")
+
+    # Estimate dimensions
+    lines = text_str.splitlines() or [" "]
+    line_height = 40
+    padding = 40
+    img_h = max(100, len(lines) * line_height + padding * 2)
+
+    img = Image.new('RGB', (target_width, img_h), color='white')
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans.ttf", 26)
+    except:
+        font = ImageFont.load_default()
+
+    y = padding
+    for line in lines:
+        draw.text((padding, y), line, fill='black', font=font)
+        y += line_height
+
+    return image_to_escpos_raster(img, target_width=target_width, dither=False)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Phomemo / QY Bluetooth Thermal Printer Direct CLI Tool"
+    )
+    parser.add_argument('file', nargs='?', help='Image or raw file to print (PNG, JPG, BMP, etc.)')
+    parser.add_argument('-d', '--device', help='Bluetooth MAC address (e.g. 5E:76:58:2F:6C:A3)')
+    parser.add_argument('-c', '--channel', type=int, default=1, help='RFCOMM channel (default: 1)')
+    parser.add_argument('-p', '--paper', default='a4', choices=list(PAPER_WIDTHS.keys()), help='Paper size / width profile')
+    parser.add_argument('-t', '--text', help='Print text string directly')
+    parser.add_argument('--no-dither', action='store_true', help='Disable Floyd-Steinberg dithering (use threshold)')
+    parser.add_argument('--raw', action='store_true', help='Send input file directly without image processing')
+    parser.add_argument('--feed', type=int, default=4, help='Number of feed lines after printing (default: 4)')
+    parser.add_argument('--scan', action='store_true', help='Scan and display Bluetooth printers')
+    parser.add_argument('--active', action='store_true', help='Perform active Bluetooth scanning when searching')
+    parser.add_argument('--pair', metavar='MAC', help='Pair, trust, and initialize SDP cache for a Bluetooth printer')
+
+    args = parser.parse_args()
+
+    if args.pair:
+        pair_device(args.pair)
+        return
+
+    if args.scan:
+        print("[*] Checking known Bluetooth printers in BlueZ...")
+        printers = scan_devices(active=args.active)
+        if not printers and not args.active:
+            print("[*] No printer found in cache. Running active discovery (5s)...")
+            printers = scan_devices(active=True, timeout=5)
+
+        if not printers:
+            print("[-] No Bluetooth printers discovered.")
+            print("    Make sure your printer is powered ON and in pairing range.")
+            print("    You can also pair manually using: phomemo-print --pair <MAC>")
+        else:
+            print(f"[+] Found {len(printers)} printer(s):")
+            for p in printers:
+                status = []
+                if p['paired']: status.append("Paired")
+                if p['connected']: status.append("Connected")
+                status_str = f" [{', '.join(status)}]" if status else ""
+                print(f"    - {p['name']} ({p['address']}){status_str}")
+        return
+
+    if not args.file and not args.text:
+        parser.print_help()
+        sys.exit(1)
+
+    target_mac = args.device
+    if not target_mac:
+        target_mac = auto_detect_device()
+        if not target_mac:
+            print("[-] Error: No Bluetooth printer specified and none auto-detected.", file=sys.stderr)
+            print("    Please specify with -d MAC or run with --scan.", file=sys.stderr)
+            sys.exit(1)
+        print(f"[+] Auto-detected printer: {target_mac}")
+
+    # Build payload
+    payload = bytearray()
+    target_width = PAPER_WIDTHS.get(args.paper.lower(), 1664)
+
+    if args.text:
+        payload.extend(text_to_raster(args.text, target_width=target_width))
+
+    elif args.file:
+        if not os.path.exists(args.file):
+            print(f"[-] Error: File not found: {args.file}", file=sys.stderr)
+            sys.exit(1)
+
+        if args.raw:
+            with open(args.file, 'rb') as f:
+                payload.extend(f.read())
+        else:
+            if not HAS_PIL:
+                print("[-] Error: Pillow is required to process images. Install with: pip install Pillow", file=sys.stderr)
+                sys.exit(1)
+            try:
+                img = Image.open(args.file)
+                payload.extend(image_to_escpos_raster(img, target_width=target_width, dither=not args.no_dither))
+            except Exception as e:
+                print(f"[-] Error loading image: {e}", file=sys.stderr)
+                sys.exit(1)
+
+    # Feed lines at end: ESC d <n>
+    if args.feed > 0:
+        payload.extend(bytes([0x1B, 0x64, min(args.feed, 20)]))
+
+    # Connect and transmit
+    try:
+        sock = connect_printer(target_mac, channel=args.channel)
+        print(f"[*] Sending {len(payload)} bytes of print data...")
+        send_in_chunks(sock, payload)
+        time.sleep(1.0)
+        sock.close()
+        print("[+] Print job transmitted successfully!")
+    except Exception as e:
+        print(f"[-] Bluetooth transmission failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

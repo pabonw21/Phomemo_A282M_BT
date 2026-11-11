@@ -98,8 +98,8 @@ sudo apt-get install cups libcups2-dev bluez python3 python3-dbus ghostscript py
 Make sure your Phomemo printer is **powered on** and nearby, then run `install.sh` as root:
 
 ```bash
-git clone https://github.com/your-username/phomemo-linux-bluetooth.git
-cd phomemo-linux-bluetooth
+git clone https://github.com/pabwal21/Phomemo_A282M_BT.git
+cd Phomemo_A282M_BT
 sudo ./install.sh
 ```
 

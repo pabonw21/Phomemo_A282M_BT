@@ -17,24 +17,29 @@ Historically, manufacturers restricted Bluetooth printing to their proprietary m
 - **Bidirectional Backchannel Support**: Implements CUPS `cupsSideChannel` and `cupsBackChannel` handling, properly answering the printer's status queries (`0x1F 0x11 0x07` -> `0x1A 0x07 0x02 0x00 0x03`).
 - **Standalone CLI Utility (`phomemo-print`)**: Print images, text, and raw files directly from the terminal or scripts without needing CUPS configured.
 - **Floyd-Steinberg Dithering**: High quality image dithering algorithm optimized for 203 DPI thermal print heads.
-- **Wide Model Compatibility**: Works with over 45+ Phomemo and QY thermal printer models.
+- **Wide Model Compatibility**: Works with over 70+ Phomemo and QY thermal printer models.
+- **Dynamic Vendor Driver Provisioning**: 100% clean open-source repository; proprietary raster filters and 70+ PPD model definitions are fetched directly from official vendor distribution during installation without committing proprietary binaries to Git.
+- **Multi-Architecture Support**: Installs matching raster filters for `x86_64`, `aarch64` (ARM64 / Raspberry Pi 4 & 5), `armhf` (Raspberry Pi 2 & 3), `arm`, and `i386`.
 
 ---
 
 ## 📋 Supported Printer Models
 
-All printers that share the QY / `rastertoM08F` raster command set are supported:
+All printers that share the QY / `rastertoM08F` raster command set are supported (70+ models across portable A4, letter, and label lines):
 
 | Series | Supported Models |
 | :--- | :--- |
 | **A-Series** | A281M, **A282M**, A285M, A28U, A886, A887 |
 | **M-Series** | M08F, M08FS, M08F-WS, M08 pro, M08E, M08E-WS, M04S |
+| **M-Label Series** | M100, M102, M105, M107, M108, M109, M110, M110S, M120, M150, M200, M208, M209, M219, M220, M221, M250, M260 |
 | **M8xx Series** | M831, M832, M832D, M833, M834, M835, M836 |
-| **P-Series** | P831, P831Max, P832, P832Max, P833, PR20 |
+| **H-Series** | H831, H832, H833 |
+| **P-Series** | P780, P831, P831Max, P832, P832Max, P833, PR20 |
 | **Q-Series** | Q300, Q301, Q301Pro, Q302 |
 | **S-Series** | S821, S821K, S821X, S822, S823, SP20 |
 | **T/TP-Series** | T08A, T08FS, T831, TP81, TP82, TP83, TP84, TP85, TP86, TP87, TP88 |
 | **G-Series** | G100, G100Pro |
+| **Other / Barcode** | B821, D50, D480BT, E6000 |
 
 ---
 
@@ -80,15 +85,16 @@ Standard Linux CUPS printing separates rendering from transport:
 - **Python 3** (with standard `socket` and `dbus` module)
 - **Ghostscript** (recommended for general PDF rendering in CUPS)
 - **Pillow** (`pip install Pillow` or `python-pillow` package, for image/CLI printing)
+- **Utilities**: `curl` (or `wget`), `unzip`, and `tar` (used by installer to fetch and unpack vendor drivers)
 
 On Arch Linux:
 ```bash
-sudo pacman -S cups bluez bluez-utils python python-dbus ghostscript python-pillow
+sudo pacman -S cups bluez bluez-utils python python-dbus ghostscript python-pillow curl unzip tar
 ```
 
 On Debian / Ubuntu / Raspberry Pi OS:
 ```bash
-sudo apt-get install cups libcups2-dev bluez python3 python3-dbus ghostscript python3-pil
+sudo apt-get install cups libcups2-dev bluez python3 python3-dbus ghostscript python3-pil curl unzip tar
 ```
 
 ---
@@ -104,13 +110,20 @@ sudo ./install.sh
 ```
 
 The installer will:
-1. Verify system dependencies (`cups`, `python3-dbus`, `ghostscript`, etc.).
-2. Copy the CUPS backend to `/usr/lib/cups/backend/phomemo-rfcomm`.
-3. Install the PPD printer descriptions to `/usr/share/cups/model/qy/`.
-4. Install the raster filter (`rastertoM08F`).
-5. Install the standalone CLI utility `/usr/local/bin/phomemo-print`.
-6. Restart the CUPS daemon.
-7. **Automatically discover, pair, trust, and configure** your Bluetooth printer queue (e.g. `Phomemo_A282M_BT`). If not previously paired, it triggers an active Bluetooth scan or prompts for your printer's MAC address.
+1. Verify system dependencies (`cups`, `python3-dbus`, `ghostscript`, `curl/wget`, `unzip`, `tar`).
+2. **Download official vendor drivers** directly from Phomemo/QY cloud storage (`https://oss.qu-in.ltd/Phomemo/QY_Printer_Driver_Linux.zip`).
+3. Detect host CPU architecture (`x86_64`, `aarch64`, `armhf`, `arm`, `i386`) and install the corresponding `rastertoM08F` raster filter.
+4. Install official PPD descriptions for **all 70+ supported models** into `/usr/share/cups/model/qy/`.
+5. Install the CUPS Bluetooth backend (`/usr/lib/cups/backend/phomemo-rfcomm`).
+6. Install the standalone CLI utility (`/usr/local/bin/phomemo-print`).
+7. Restart the CUPS daemon.
+8. **Automatically discover, pair, trust, and configure** your Bluetooth printer queue (e.g. `Phomemo_A282M_BT` or matching model) using its dedicated model PPD.
+
+#### Offline / Air-Gapped Installation
+If installing on a machine without direct internet access:
+1. Download `QY_Printer_Driver_Linux.zip` manually from `https://oss.qu-in.ltd/Phomemo/QY_Printer_Driver_Linux.zip`.
+2. Place the zip file in the root of this repository (or in `/tmp/`).
+3. Run `sudo ./install.sh`. The installer will detect and use the local archive automatically.
 
 ---
 
@@ -208,5 +221,6 @@ sudo ./uninstall.sh
 
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE).
-Printer PPDs and command protocols remain the property of their respective manufacturers.
+This project's open-source components (Bluetooth RFCOMM CUPS backend `phomemo-rfcomm`, CLI utility `phomemo-print`, and installer scripts) are licensed under the [MIT License](LICENSE).
+
+Proprietary raster filters and PPD printer descriptions fetched during installation remain the property of their respective manufacturer (Zhuhai Quint Technology / Phomemo) and are downloaded directly from vendor distribution for local device interoperability.

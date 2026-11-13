@@ -49,6 +49,14 @@ if [ -f /usr/local/bin/phomemo-print ]; then
     rm -f /usr/local/bin/phomemo-print
 fi
 
+# Clean up QY PPD directory
+for model_dir in /usr/share/cups/model/qy /usr/share/ppd/qy /usr/local/share/cups/model/qy; do
+    if [ -d "$model_dir" ]; then
+        echo -e "${YELLOW}[*] Removing PPD directory ${model_dir}...${NC}"
+        rm -rf "$model_dir"
+    fi
+done
+
 echo -e "${YELLOW}[*] Restarting CUPS spooler...${NC}"
 if systemctl is-active cups >/dev/null 2>&1; then
     systemctl restart cups

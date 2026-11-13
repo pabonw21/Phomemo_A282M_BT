@@ -154,7 +154,7 @@ See [docs/bluetooth_pairing.md](docs/bluetooth_pairing.md) for detailed informat
 ## 🖨️ Printing
 
 ### Option 1: Printing from any Desktop Application
-Open any document in Chrome, Firefox, LibreOffice, Evince, Okular, etc., press `Ctrl + P`, and select i.e. **Phomemo_A282M_BT**.
+Open any document in Chrome, Firefox, LibreOffice, Evince, Okular, etc., press `Ctrl + P`, and select your printer model, i.e. **Phomemo_A282M_BT**.
 
 ### Option 2: Printing via CUPS Command Line
 ```bash
